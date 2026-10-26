@@ -1,0 +1,209 @@
+<#
+.SYNOPSIS
+    Verify that generated KiCad output files exist, are non-empty, and contain
+    expected content.
+
+.DESCRIPTION
+    Checks manufacturing and validation output files produced by the other
+    scripts in this framework. For each expected file or directory it reports
+    whether it exists, whether it is non-empty, and (for validation reports)
+    whether it parses cleanly with zero violations.
+
+    This is a post-generation verification step only. It does NOT run any
+    KiCad CLI command, does NOT modify project files, and does NOT perform
+    design-rule checks or hardware testing.
+
+    File existence, non-empty size, and zero reported violations do NOT prove
+    electrical correctness or functional validity of the hardware.
+
+.PARAMETER ProjectDir
+    Absolute path to the ESP32_BME280 project directory.
+
+.PARAMETER CheckManufacturing
+    Also verify manufacturing outputs (gerbers and drill directories).
+
+.PARAMETER CheckValidation
+    Also verify validation reports (ERC and DRC report files).
+
+.PARAMETER CheckErcJson
+    Also verify the JSON variant of the ERC report (only produced when
+    validate_project.ps1 is run with -ErcFormat json).
+
+.EXAMPLE
+    .\scripts\check_outputs.ps1 -ProjectDir "C:\Users\Anirudh\OneDrive\Documents\kicad ai\ESP32_BME280" -CheckManufacturing -CheckValidation
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [string] $ProjectDir,
+
+    [switch] $CheckManufacturing,
+    [switch] $CheckValidation,
+    [switch] $CheckErcJson
+)
+
+$ErrorActionPreference = 'Stop'
+$script:scriptName = [System.IO.Path]::GetFileName($MyInvocation.MyCommand.Path)
+$script:failures = @()
+
+function Write-Status {
+    param([string] $Message, [string] $Level = "INFO")
+    $prefix = switch ($Level) {
+        "PASS" { "PASS" }
+        "FAIL" { "FAIL" }
+        "WARN" { "WARN" }
+        default { "INFO" }
+    }
+    Write-Host ("[{0}] {1}: {2}" -f $prefix, $script:scriptName, $Message)
+}
+
+function Test-OutputPath {
+    param([string] $Label, [string] $Path, [switch] $MustBeNonEmpty)
+
+    if (!(Test-Path -LiteralPath $Path)) {
+        $script:failures += "MISSING: $Label ($Path)"
+        Write-Status ("{0}: MISSING ({1})" -f $Label, $Path) "FAIL"
+        return
+    }
+
+    $item = Get-Item -LiteralPath $Path
+    if ($MustBeNonEmpty) {
+        if ($item.PSIsContainer) {
+            $childCount = (Get-ChildItem -LiteralPath $Path -Force | Measure-Object).Count
+            if ($childCount -eq 0) {
+                $script:failures += "EMPTY (no children): $Label ($Path)"
+                Write-Status ("{0}: EMPTY directory ({1})" -f $Label, $Path) "FAIL"
+                return
+            }
+            Write-Status ("{0}: OK ({1} item(s))" -f $Label, $childCount) "PASS"
+        } else {
+            if ($item.Length -eq 0) {
+                $script:failures += "EMPTY (0 bytes): $Label ($Path)"
+                Write-Status ("{0}: EMPTY file (0 bytes) ({1})" -f $Label, $Path) "FAIL"
+                return
+            }
+            Write-Status ("{0}: OK ({1} bytes)" -f $Label, $item.Length) "PASS"
+        }
+    } else {
+        Write-Status ("{0}: EXISTS" -f $Label) "PASS"
+    }
+}
+
+function Test-ErcReportContent {
+    param([string] $Path)
+    if (!(Test-Path -LiteralPath $Path -PathType Leaf)) {
+        $script:failures += "MISSING: ERC report ($Path)"
+        Write-Status ("ERC report: MISSING ({0})" -f $Path) "FAIL"
+        return
+    }
+    $content = Get-Content -LiteralPath $Path -Raw -ErrorAction SilentlyContinue
+    if ([string]::IsNullOrWhiteSpace($content)) {
+        $script:failures += "EMPTY: ERC report ($Path)"
+        Write-Status ("ERC report: EMPTY ({0})" -f $Path) "FAIL"
+        return
+    }
+    if ($content -match "ERC messages:\s*(?<m>\d+)\s*Errors\s*(?<e>\d+)\s*Warnings\s*(?<w>\d+)") {
+        $e = [int]$Matches['e']
+        $w = [int]$Matches['w']
+        if ($e -gt 0 -or $w -gt 0) {
+            $script:failures += "ERC report contains violations: $e error(s), $w warning(s) ($Path)"
+            Write-Status ("ERC report: VIOLATIONS (E=$e W=$w)" -f $e, $w) "FAIL"
+            return
+        }
+        Write-Status ("ERC report: OK (E=0 W=0)" ) "PASS"
+    } else {
+        $script:failures += "ERC report unparseable: $Path"
+        Write-Status ("ERC report: UNPARSEABLE ({0})" -f $Path) "FAIL"
+    }
+}
+
+function Test-DrcReportContent {
+    param([string] $Path)
+    if (!(Test-Path -LiteralPath $Path -PathType Leaf)) {
+        $script:failures += "MISSING: DRC report ($Path)"
+        Write-Status ("DRC report: MISSING ({0})" -f $Path) "FAIL"
+        return
+    }
+    $content = Get-Content -LiteralPath $Path -Raw -ErrorAction SilentlyContinue
+    if ([string]::IsNullOrWhiteSpace($content)) {
+        $script:failures += "EMPTY: DRC report ($Path)"
+        Write-Status ("DRC report: EMPTY ({0})" -f $Path) "FAIL"
+        return
+    }
+    $v = -1; $u = -1; $f = -1
+    if ($content -match "Found\s+(?<v>\d+)\s+DRC violations") { $v = [int]$Matches['v'] }
+    if ($content -match "Found\s+(?<u>\d+)\s+unconnected pads") { $u = [int]$Matches['u'] }
+    if ($content -match "Found\s+(?<f>\d+)\s+Footprint errors") { $f = [int]$Matches['f'] }
+    if ($v -gt 0 -or $u -gt 0 -or $f -gt 0) {
+        $script:failures += "DRC report contains violations: $v violation(s), $u unconnected pad(s), $f footprint error(s) ($Path)"
+        Write-Status ("DRC report: VIOLATIONS (V=$v U=$u F=$f)" -f $v, $u, $f) "FAIL"
+        return
+    }
+    Write-Status ("DRC report: OK (V=0 U=0 F=0)" ) "PASS"
+}
+
+$validationDir = Join-Path -Path $ProjectDir -ChildPath "outputs\validation"
+$manufacturingDir = Join-Path -Path $ProjectDir -ChildPath "outputs\manufacturing"
+
+Write-Host "Checking outputs under: $ProjectDir"
+Write-Host ""
+
+$runValidation = $CheckValidation
+$runManufacturing = $CheckManufacturing
+if (!$runValidation -and !$runManufacturing) {
+    $runValidation = $true
+    $runManufacturing = $true
+}
+
+if ($runValidation) {
+    Write-Status "Checking validation reports..."
+    Test-ErcReportContent -Path (Join-Path $validationDir "ESP32_BME280_erc_report.txt")
+    if ($CheckErcJson) {
+        Test-OutputPath -Label "ERC JSON report" -Path (Join-Path $validationDir "ESP32_BME280_erc_report.json") -MustBeNonEmpty
+    }
+    Test-DrcReportContent -Path (Join-Path $validationDir "ESP32_BME280_drc_report.txt")
+}
+
+if ($runManufacturing) {
+    Write-Status "Checking manufacturing outputs..."
+    Test-OutputPath -Label "Gerber directory" -Path (Join-Path $manufacturingDir "gerbers") -MustBeNonEmpty
+    Test-OutputPath -Label "Drill directory" -Path (Join-Path $manufacturingDir "drill") -MustBeNonEmpty
+
+    # Check drill file is not just headers (obvious empty manufacturing output)
+    $drillFile = Join-Path $manufacturingDir "drill\ESP32_BME280.drl"
+    if (Test-Path -LiteralPath $drillFile -PathType Leaf) {
+        $drillContent = Get-Content -LiteralPath $drillFile -Raw -ErrorAction SilentlyContinue
+        if ([string]::IsNullOrWhiteSpace($drillContent) -or $drillContent -notmatch '^[A-Z].*[X0-9].*$' -and $drillContent -notmatch 'M30|T\d+') {
+            # Very basic heuristic: drill file with no tool changes or coordinates is suspicious
+            if ($drillContent -notmatch 'T\d+') {
+                Write-Status ("WARN: Drill file contains no tool commands (may be empty of actual drill hits): $drillFile") "WARN"
+            }
+        }
+    }
+
+    # Check gerber directory has more than just a .gbrjob file (obvious empty output)
+    $gerberDir = Join-Path $manufacturingDir "gerbers"
+    if (Test-Path -LiteralPath $gerberDir -PathType Container) {
+        $gerberFiles = Get-ChildItem -LiteralPath $gerberDir -Filter "*.gbr" -File
+        if ($gerberFiles.Count -eq 0) {
+            $script:failures += "NO GERBER FILES: $gerberDir contains no .gbr files"
+            Write-Status ("Gerber directory: NO .gbr FILES ({0})" -f $gerberDir) "FAIL"
+        }
+    }
+}
+
+Write-Host ""
+if ($script:failures.Count -gt 0) {
+    Write-Status "OUTPUT CHECK FAILED" "FAIL"
+    foreach ($f in $script:failures) {
+        Write-Host ("  - {0}" -f $f)
+    }
+    exit 1
+}
+
+Write-Status "ALL OUTPUTS PRESENT, NON-EMPTY, AND PARSE CLEANLY" "PASS"
+Write-Host ""
+Write-Host "NOTE: File existence, non-empty size, and zero reported violations do NOT"
+Write-Host "prove electrical correctness. Run validate_project.ps1 for ERC/DRC"
+Write-Host "verification. These checks are not hardware testing."
+exit 0

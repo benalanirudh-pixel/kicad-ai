@@ -1,0 +1,344 @@
+<#
+.SYNOPSIS
+    Run KiCad design-rule checks (schematic ERC and PCB DRC) and save reports.
+
+.DESCRIPTION
+    Runs two independent design-rule checks using the KiCad 10.0 CLI:
+
+      1. Schematic Electrical Rules Check (ERC):  kicad-cli sch erc --exit-code-violations
+      2. PCB Design Rules Check (DRC):             kicad-cli pcb drc --exit-code-violations
+
+    The --exit-code-violations flag makes the CLI return a non-zero exit code when
+    violations exist. This script also independently parses the generated report
+    files to count violations, so that exit code zero alone is never treated as
+    proof of a clean design.
+
+    IMPORTANT: These are DESIGN-RULE CHECKS only. They verify the design against
+    KiCad's electrical and physical design rules. They do NOT constitute
+    hardware testing, functional validation, or certification of the physical
+    board. A passing result means no design-rule violations were reported; it
+    does NOT mean the circuit is electrically correct or manufacturable.
+
+    This script never modifies the schematic, PCB, or project settings, and it
+    never deletes the lock file.
+
+.PARAMETER ProjectDir
+    Absolute path to the ESP32_BME280 project directory.
+
+.PARAMETER KicadCli
+    Absolute path to the kicad-cli.exe executable.
+
+.PARAMETER OutputDir
+    Directory where ERC and DRC reports will be written. Defaults to
+    <ProjectDir>\outputs\validation.
+
+.PARAMETER ErcFormat
+    Output format for the ERC report: "report" or "json". Default: "report".
+
+.PARAMETER ErcUnits
+    Report units for the ERC report: "in", "mm", or "mils". Default: "mm".
+
+.PARAMETER ErcSeverityAll
+    Report all ERC violations (all severity levels).
+
+.PARAMETER ErcSeverityError
+    Report ERC error-level violations.
+
+.PARAMETER ErcSeverityWarning
+    Report ERC warning-level violations.
+
+.PARAMETER ErcSeverityExclusions
+    Report excluded ERC violations.
+
+.EXAMPLE
+    .\scripts\validate_project.ps1 `
+        -ProjectDir "C:\Users\Anirudh\OneDrive\Documents\kicad ai\ESP32_BME280" `
+        -KicadCli "C:\Users\Anirudh\AppData\Local\Programs\KiCad\10.0\bin\kicad-cli.exe"
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [string] $ProjectDir,
+
+    [Parameter(Mandatory = $true)]
+    [string] $KicadCli,
+
+    [string] $OutputDir = "",
+
+    [ValidateSet("report", "json")]
+    [string] $ErcFormat = "report",
+
+    [ValidateSet("in", "mm", "mils")]
+    [string] $ErcUnits = "mm",
+
+    [switch] $ErcSeverityAll,
+    [switch] $ErcSeverityError,
+    [switch] $ErcSeverityWarning,
+    [switch] $ErcSeverityExclusions
+)
+
+$ErrorActionPreference = 'Stop'
+$script:scriptName = [System.IO.Path]::GetFileName($MyInvocation.MyCommand.Path)
+$script:failures = @()
+$script:checksRun = @()
+
+function Write-Status {
+    param([string] $Message, [string] $Level = "INFO")
+    $prefix = switch ($Level) {
+        "PASS" { "PASS" }
+        "FAIL" { "FAIL" }
+        "WARN" { "WARN" }
+        "INCOMPLETE" { "INCOMPLETE" }
+        default { "INFO" }
+    }
+    Write-Host ("[{0}] {1}: {2}" -f $prefix, $script:scriptName, $Message)
+}
+
+# Resolve output directory
+if ([string]::IsNullOrWhiteSpace($OutputDir)) {
+    $OutputDir = Join-Path -Path $ProjectDir -ChildPath "outputs\validation"
+}
+if (!(Test-Path -LiteralPath $OutputDir -PathType Container)) {
+    try {
+        New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+    } catch {
+        Write-Status "Failed to create output directory: $OutputDir" "FAIL"
+        exit 1
+    }
+}
+
+# Resolve input files
+$schFile = Join-Path -Path $ProjectDir -ChildPath "ESP32_BME280.kicad_sch"
+$pcbFile = Join-Path -Path $ProjectDir -ChildPath "ESP32_BME280.kicad_pcb"
+
+$ercReport = Join-Path -Path $OutputDir -ChildPath "ESP32_BME280_erc_report.txt"
+$drcReport = Join-Path -Path $OutputDir -ChildPath "ESP32_BME280_drc_report.txt"
+
+# ---- Helper: parse ERC report for violation counts ----
+function Parse-ErcReport {
+    param([string] $Path)
+    if (!(Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return @{ Errors = -1; Warnings = -1; Parseable = $false }
+    }
+    $content = Get-Content -LiteralPath $Path -Raw -ErrorAction SilentlyContinue
+    if ([string]::IsNullOrWhiteSpace($content)) {
+        return @{ Errors = -1; Warnings = -1; Parseable = $false }
+    }
+    $errors = -1
+    $warnings = -1
+    # Match lines like: " ERC messages: 0  Errors 0  Warnings 0"
+    if ($content -match "ERC messages:\s*(?<m>\d+)\s*Errors\s*(?<e>\d+)\s*Warnings\s*(?<w>\d+)") {
+        $errors = [int]$Matches['e']
+        $warnings = [int]$Matches['w']
+        return @{ Errors = $errors; Warnings = $warnings; Parseable = $true }
+    }
+    return @{ Errors = -1; Warnings = -1; Parseable = $false }
+}
+
+# ---- Helper: parse DRC report for violation counts ----
+function Parse-DrcReport {
+    param([string] $Path)
+    if (!(Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return @{ Violations = -1; Unconnected = -1; FootprintErrors = -1; Parseable = $false }
+    }
+    $content = Get-Content -LiteralPath $Path -Raw -ErrorAction SilentlyContinue
+    if ([string]::IsNullOrWhiteSpace($content)) {
+        return @{ Violations = -1; Unconnected = -1; FootprintErrors = -1; Parseable = $false }
+    }
+    $violations = -1
+    $unconnected = -1
+    $footprintErrors = -1
+    if ($content -match "Found\s+(?<v>\d+)\s+DRC violations") {
+        $violations = [int]$Matches['v']
+    }
+    if ($content -match "Found\s+(?<u>\d+)\s+unconnected pads") {
+        $unconnected = [int]$Matches['u']
+    }
+    if ($content -match "Found\s+(?<f>\d+)\s+Footprint errors") {
+        $footprintErrors = [int]$Matches['f']
+    }
+    return @{ Violations = $violations; Unconnected = $unconnected; FootprintErrors = $footprintErrors; Parseable = $true }
+}
+
+# ---- Helper: detect empty schematic (no components, no nets, no pins) ----
+function Test-EmptySchematic {
+    param([string] $Path)
+    if (!(Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $true
+    }
+    $content = Get-Content -LiteralPath $Path -Raw -ErrorAction SilentlyContinue
+    if ([string]::IsNullOrWhiteSpace($content)) {
+        return $true
+    }
+    # A non-empty schematic contains at least one symbol instance or net
+    if ($content -match '\(symbol ') {
+        return $false
+    }
+    if ($content -match '\(net ') {
+        return $false
+    }
+    return $true
+}
+
+# ---- Helper: detect PCB without valid Edge.Cuts outline ----
+function Test-PcbMissingOutline {
+    param([string] $Path)
+    if (!(Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $true
+    }
+    $content = Get-Content -LiteralPath $Path -Raw -ErrorAction SilentlyContinue
+    if ([string]::IsNullOrWhiteSpace($content)) {
+        return $true
+    }
+    # A valid board has an Edge.Cuts layer with at least one graphic line/arc/polygon
+    if ($content -match 'Edge\.Cuts') {
+        # Check that there is at least one graphic element on Edge.Cuts
+        if ($content -match '\(gr_line.*Edge\.Cuts\)|\(gr_arc.*Edge\.Cuts\)|\(gr_circle.*Edge\.Cuts\)|\(gr_poly.*Edge\.Cuts\)|\(fp_line.*Edge\.Cuts\)') {
+            return $false
+        }
+        return $true  # Edge.Cuts referenced but no geometry
+    }
+    return $true  # No Edge.Cuts layer at all
+}
+
+# ---- Pre-check: detect incomplete design ----
+Write-Status "Checking design completeness..."
+
+$emptySch = Test-EmptySchematic -Path $schFile
+$missingOutline = Test-PcbMissingOutline -Path $pcbFile
+
+$incomplete = $false
+if ($emptySch) {
+    $script:failures += "INCOMPLETE: Schematic is empty (no symbols or nets found). ERC passes trivially on a blank schematic."
+    Write-Status "Schematic is empty" "INCOMPLETE"
+    $incomplete = $true
+} else {
+    Write-Status "Schematic contains content" "PASS"
+}
+
+if ($missingOutline) {
+    $script:failures += "INCOMPLETE: PCB has no valid Edge.Cuts outline. Board cannot be fabricated."
+    Write-Status "PCB missing Edge.Cuts outline" "INCOMPLETE"
+    $incomplete = $true
+} else {
+    Write-Status "PCB has Edge.Cuts outline" "PASS"
+}
+
+# ---- 1. Schematic ERC ----
+Write-Status "Running schematic ERC on: $schFile"
+$ercArgs = @("sch", "erc", $schFile, "-o", $ercReport, "--format", $ErcFormat, "--units", $ErcUnits, "--exit-code-violations")
+if ($ErcSeverityAll) { $ercArgs += "--severity-all" }
+if ($ErcSeverityError) { $ercArgs += "--severity-error" }
+if ($ErcSeverityWarning) { $ercArgs += "--severity-warning" }
+if ($ErcSeverityExclusions) { $ercArgs += "--severity-exclusions" }
+
+$ercCliExitCode = -1
+try {
+    & $KicadCli @ercArgs 2>&1 | Out-String
+    $ercCliExitCode = $LASTEXITCODE
+} catch {
+    $ercCliExitCode = -1
+    $script:failures += "Schematic ERC did not run successfully: $($_.Exception.Message)"
+    Write-Status "Schematic ERC did not run successfully" "FAIL"
+}
+
+# Parse the actual ERC report regardless of exit code
+$ercParsed = Parse-ErcReport -Path $ercReport
+$ercHasViolations = $false
+if (-not $ercParsed.Parseable) {
+    $script:failures += "ERC report could not be parsed or is missing: $ercReport"
+    Write-Status "ERC report unparseable" "FAIL"
+    $ercHasViolations = $true
+} elseif ($ercParsed.Errors -gt 0 -or $ercParsed.Warnings -gt 0) {
+    $ercHasViolations = $true
+    $script:failures += "ERC reported $($ercParsed.Errors) error(s), $($ercParsed.Warnings) warning(s)"
+    Write-Status "ERC reported violations (E=$($ercParsed.Errors) W=$($ercParsed.Warnings))" "FAIL"
+} else {
+    Write-Status "ERC report: 0 errors, 0 warnings" "PASS"
+}
+
+# CLI exit code must be 0 for successful execution
+if ($ercCliExitCode -ne 0) {
+    $script:failures += "Schematic ERC CLI exited with code $ercCliExitCode"
+    Write-Status "Schematic ERC CLI exit code: $ercCliExitCode" "FAIL"
+} else {
+    Write-Status "Schematic ERC CLI completed (exit 0)" "PASS"
+}
+
+$script:checksRun += @{ Name = "schematic ERC"; CliExitCode = $ercCliExitCode; Parsed = $ercParsed; HasViolations = $ercHasViolations; Report = $ercReport }
+
+Write-Host ("  ERC report: {0}" -f $ercReport)
+
+# ---- 2. PCB DRC ----
+Write-Status "Running PCB DRC on: $pcbFile"
+$drcArgs = @("pcb", "drc", $pcbFile, "-o", $drcReport, "--exit-code-violations")
+
+$drcCliExitCode = -1
+try {
+    & $KicadCli @drcArgs 2>&1 | Out-String
+    $drcCliExitCode = $LASTEXITCODE
+} catch {
+    $drcCliExitCode = -1
+    $script:failures += "PCB DRC did not run successfully: $($_.Exception.Message)"
+    Write-Status "PCB DRC did not run successfully" "FAIL"
+}
+
+# Parse the actual DRC report regardless of exit code
+$drcParsed = Parse-DrcReport -Path $drcReport
+$drcHasViolations = $false
+if (-not $drcParsed.Parseable) {
+    $script:failures += "DRC report could not be parsed or is missing: $drcReport"
+    Write-Status "DRC report unparseable" "FAIL"
+    $drcHasViolations = $true
+} elseif ($drcParsed.Violations -gt 0 -or $drcParsed.Unconnected -gt 0 -or $drcParsed.FootprintErrors -gt 0) {
+    $drcHasViolations = $true
+    $script:failures += "DRC reported $($drcParsed.Violations) violation(s), $($drcParsed.Unconnected) unconnected pad(s), $($drcParsed.FootprintErrors) footprint error(s)"
+    Write-Status "DRC reported violations (V=$($drcParsed.Violations) U=$($drcParsed.Unconnected) F=$($drcParsed.FootprintErrors))" "FAIL"
+} else {
+    Write-Status "DRC report: 0 violations, 0 unconnected, 0 footprint errors" "PASS"
+}
+
+if ($drcCliExitCode -ne 0) {
+    $script:failures += "PCB DRC CLI exited with code $drcCliExitCode"
+    Write-Status "PCB DRC CLI exit code: $drcCliExitCode" "FAIL"
+} else {
+    Write-Status "PCB DRC CLI completed (exit 0)" "PASS"
+}
+
+$script:checksRun += @{ Name = "PCB DRC"; CliExitCode = $drcCliExitCode; Parsed = $drcParsed; HasViolations = $drcHasViolations; Report = $drcReport }
+
+Write-Host ("  DRC report: {0}" -f $drcReport)
+
+# ---- Summary ----
+Write-Host ""
+Write-Host "========================================"
+Write-Host " DESIGN-RULE CHECK SUMMARY"
+Write-Host "========================================"
+foreach ($c in $script:checksRun) {
+    $cliStatus = if ($c.CliExitCode -eq 0) { "CLI OK" } else { "CLI FAIL (exit $($c.CliExitCode))" }
+    $violStatus = if ($c.HasViolations) { "VIOLATIONS" } else { "NO VIOLATIONS" }
+    Write-Host ("  {0,-20} : {1}, {2}" -f $c.Name, $cliStatus, $violStatus)
+    Write-Host ("                 report: {0}" -f $c.Report)
+}
+Write-Host ""
+
+# Final determination: PASS only if everything ran, reports parsed clean, no violations, and design is complete
+$allCliOk = ($script:checksRun | Where-Object { $_.CliExitCode -ne 0 }).Count -eq 0
+$allParsed = ($script:checksRun | Where-Object { -not $_.Parsed }).Count -eq 0
+$noViolations = ($script:checksRun | Where-Object { $_.HasViolations }).Count -eq 0
+$designComplete = -not $incomplete
+
+if ($script:failures.Count -gt 0 -or -not $allCliOk -or -not $allParsed -or -not $noViolations -or -not $designComplete) {
+    Write-Status "VALIDATION NOT PASSED" "FAIL"
+    Write-Host ""
+    Write-Host "NOTE: These are design-rule checks only (ERC/DRC). They do NOT replace"
+    Write-Host "hardware testing, functional validation, or manufacturability review."
+    exit 1
+}
+
+Write-Status "ALL DESIGN-RULE CHECKS PASSED (no violations reported)" "PASS"
+Write-Host ""
+Write-Host "NOTE: A passing ERC/DRC means no design-rule violations were reported."
+Write-Host "It does NOT mean the hardware has been tested or is functionally correct."
+Write-Host "These are design-rule checks, not hardware validation."
+exit 0

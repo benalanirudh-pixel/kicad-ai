@@ -1,0 +1,208 @@
+<#
+.SYNOPSIS
+    Run KiCad design-rule checks (schematic ERC and PCB DRC) and save reports.
+
+.DESCRIPTION
+    Runs two independent design-rule checks using the KiCad 10.0 CLI:
+
+      1. Schematic Electrical Rules Check (ERC):  kicad-cli sch erc
+      2. PCB Design Rules Check (DRC):             kicad-cli pcb drc
+
+    Reports are written to the specified output directory. The exit code of
+    each CLI invocation is captured and reported. A non-zero exit code means
+    violations were found OR the check did not complete successfully.
+
+    IMPORTANT: These are DESIGN-RULE CHECKS only. They verify the design against
+    KiCad's electrical and physical design rules. They do NOT constitute
+    hardware testing, functional validation, or certification of the physical
+    board. A passing result means no design-rule violations were reported; it
+    does NOT mean the circuit is electrically correct or manufacturable.
+
+    This script never modifies the schematic, PCB, or project settings, and it
+    never deletes the lock file.
+
+.PARAMETER ProjectDir
+    Absolute path to the ESP32_BME280 project directory.
+
+.PARAMETER KicadCli
+    Absolute path to the kicad-cli.exe executable.
+
+.PARAMETER OutputDir
+    Directory where ERC and DRC reports will be written. Defaults to
+    <ProjectDir>\outputs\validation.
+
+.PARAMETER ErcFormat
+    Output format for the ERC report: "report" or "json". Default: "report".
+
+.PARAMETER ErcUnits
+    Report units for the ERC report: "in", "mm", or "mils". Default: "mm".
+
+.PARAMETER ErcSeverityAll
+    Report all ERC violations (all severity levels).
+
+.PARAMETER ErcSeverityError
+    Report ERC error-level violations.
+
+.PARAMETER ErcSeverityWarning
+    Report ERC warning-level violations.
+
+.PARAMETER ErcSeverityExclusions
+    Report excluded ERC violations.
+
+.PARAMETER ErcExitCodeViolations
+    Make `kicad-cli sch erc` return a non-zero exit code if violations exist.
+
+.EXAMPLE
+    .\scripts\validate_project.ps1 `
+        -ProjectDir "C:\Users\Anirudh\OneDrive\Documents\kicad ai\ESP32_BME280" `
+        -KicadCli "C:\Users\Anirudh\AppData\Local\Programs\KiCad\10.0\bin\kicad-cli.exe" `
+        -ErcExitCodeViolations
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [string] $ProjectDir,
+
+    [Parameter(Mandatory = $true)]
+    [string] $KicadCli,
+
+    [string] $OutputDir = "",
+
+    [ValidateSet("report", "json")]
+    [string] $ErcFormat = "report",
+
+    [ValidateSet("in", "mm", "mils")]
+    [string] $ErcUnits = "mm",
+
+    [switch] $ErcSeverityAll,
+    [switch] $ErcSeverityError,
+    [switch] $ErcSeverityWarning,
+    [switch] $ErcSeverityExclusions,
+    [switch] $ErcExitCodeViolations
+)
+
+$ErrorActionPreference = 'Stop'
+$scriptName = [System.IO.Path]::GetFileName($MyInvocation.MyCommand.Path)
+$failures = @()
+$checksRun = @()
+
+function Write-Status {
+    param([string] $Message, [string] $Level = "INFO")
+    $prefix = switch ($Level) {
+        "PASS" { "PASS" }
+        "FAIL" { "FAIL" }
+        "WARN" { "WARN" }
+        default { "INFO" }
+    }
+    Write-Host ("[{0}] {1}: {2}" -f $prefix, $scriptName, $Message)
+}
+
+# Resolve output directory
+if ([string]::IsNullOrWhiteSpace($OutputDir)) {
+    $OutputDir = Join-Path -Path $ProjectDir -ChildPath "outputs\validation"
+}
+if (!(Test-Path -LiteralPath $OutputDir -PathType Container)) {
+    try {
+        New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+    } catch {
+        Write-Status "Failed to create output directory: $OutputDir" "FAIL"
+        exit 1
+    }
+}
+
+# Resolve input files (quote-safe for spaces)
+$schFile = Join-Path -Path $ProjectDir -ChildPath "ESP32_BME280.kicad_sch"
+$pcbFile = Join-Path -Path $ProjectDir -ChildPath "ESP32_BME280.kicad_pcb"
+
+$ercReport = Join-Path -Path $OutputDir -ChildPath "ESP32_BME280_erc_report.txt"
+$ercJson   = Join-Path -Path $OutputDir -ChildPath "ESP32_BME280_erc_report.json"
+$drcReport = Join-Path -Path $OutputDir -ChildPath "ESP32_BME280_drc_report.txt"
+
+# ---- 1. Schematic ERC ----
+Write-Status "Running schematic ERC on: $schFile"
+$ercArgs = @("sch", "erc", $schFile, "-o", $ercReport, "--format", $ErcFormat, "--units", $ErcUnits)
+if ($ErcSeverityAll) { $ercArgs += "--severity-all" }
+if ($ErcSeverityError) { $ercArgs += "--severity-error" }
+if ($ErcSeverityWarning) { $ercArgs += "--severity-warning" }
+if ($ErcSeverityExclusions) { $ercArgs += "--severity-exclusions" }
+if ($ErcExitCodeViolations) { $ercArgs += "--exit-code-violations" }
+
+try {
+    & $KicadCli @ercArgs 2>&1 | Out-String
+    $ercExitCode = $LASTEXITCODE
+    $checksRun += @{ Name = "schematic ERC"; ExitCode = $ercExitCode; Report = $ercReport }
+    if ($ercExitCode -eq 0) {
+        Write-Status "Schematic ERC completed (exit 0)" "PASS"
+    } else {
+        Write-Status "Schematic ERC reported violations or errors (exit $ercExitCode)" "FAIL"
+        $failures += "Schematic ERC exited with code $ercExitCode"
+    }
+} catch {
+    $ercExitCode = -1
+    $checksRun += @{ Name = "schematic ERC"; ExitCode = -1; Report = $ercReport }
+    $failures += "Schematic ERC did not run successfully: $($_.Exception.Message)"
+    Write-Status "Schematic ERC did not run successfully" "FAIL"
+}
+
+# Copy JSON variant when requested
+if ($ErcFormat -eq "json" -and (Test-Path -LiteralPath $ercReport -PathType Leaf)) {
+    try {
+        Copy-Item -LiteralPath $ercReport -Destination $ercJson -Force | Out-Null
+    } catch {
+        Write-Status "Could not create JSON copy of ERC report" "WARN"
+    }
+}
+
+Write-Host ("  ERC report: {0}" -f $ercReport)
+
+# ---- 2. PCB DRC ----
+Write-Status "Running PCB DRC on: $pcbFile"
+
+try {
+    & $KicadCli pcb drc $pcbFile -o $drcReport 2>&1 | Out-String
+    $drcExitCode = $LASTEXITCODE
+    $checksRun += @{ Name = "PCB DRC"; ExitCode = $drcExitCode; Report = $drcReport }
+    if ($drcExitCode -eq 0) {
+        Write-Status "PCB DRC completed (exit 0)" "PASS"
+    } else {
+        Write-Status "PCB DRC reported violations or errors (exit $drcExitCode)" "FAIL"
+        $failures += "PCB DRC exited with code $drcExitCode"
+    }
+} catch {
+    $drcExitCode = -1
+    $checksRun += @{ Name = "PCB DRC"; ExitCode = -1; Report = $drcReport }
+    $failures += "PCB DRC did not run successfully: $($_.Exception.Message)"
+    Write-Status "PCB DRC did not run successfully" "FAIL"
+}
+
+Write-Host ("  DRC report: {0}" -f $drcReport)
+
+# ---- Summary ----
+Write-Host ""
+Write-Host "========================================"
+Write-Host " DESIGN-RULE CHECK SUMMARY"
+Write-Host "========================================"
+foreach ($c in $checksRun) {
+    $status = if ($c.ExitCode -eq 0) { "PASS" } else { "FAIL (exit $($c.ExitCode))" }
+    Write-Host ("  {0,-20} : {1}" -f $c.Name, $status)
+    Write-Host ("                 report: {0}" -f $c.Report)
+}
+Write-Host ""
+
+# IMPORTANT: Never claim the design is validated if any check did not run
+# successfully or reported violations.
+if ($failures.Count -gt 0) {
+    Write-Status "VALIDATION NOT PASSED - design-rule violations or check failures detected" "FAIL"
+    Write-Host ""
+    Write-Host "NOTE: These are design-rule checks only (ERC/DRC). They do NOT replace"
+    Write-Host "hardware testing, functional validation, or manufacturability review."
+    exit 1
+}
+
+# All checks ran and exited 0
+Write-Status "ALL DESIGN-RULE CHECKS PASSED (no violations reported)" "PASS"
+Write-Host ""
+Write-Host "NOTE: A passing ERC/DRC means no design-rule violations were reported."
+Write-Host "It does NOT mean the hardware has been tested or is functionally correct."
+Write-Host "These are design-rule checks, not hardware validation."
+exit 0

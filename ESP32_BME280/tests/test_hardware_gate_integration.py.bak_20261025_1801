@@ -1,0 +1,574 @@
+#!/usr/bin/env python3
+"""
+Integration tests for hardware safety gates in the KiCad pipeline.
+
+Tests that unresolved/conflicting hardware assumptions block pipeline
+operations at the correct points, and that gates cannot be bypassed.
+Uses mocks and temporary fixtures. Does not modify active project files.
+"""
+
+import json
+import os
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch, MagicMock
+from pathlib import Path
+
+AI_DIR = r"C:\Users\Anirudh\OneDrive\Documents\kicad ai\ESP32_BME280\scripts\ai"
+if AI_DIR not in sys.path:
+    sys.path.insert(0, AI_DIR)
+
+import ai_pipeline
+from hardware_profile import (
+    HardwareFact, HardwareProfile,
+    CONFIDENCE_VERIFIED, CONFIDENCE_ASSUMED, CONFIDENCE_UNRESOLVED, CONFIDENCE_CONFLICTING,
+)
+
+
+def make_verified_profile_dict():
+    """Build a profile JSON dict with all U1-U7 assumptions verified + footprint."""
+    data = {}
+    for uid in ["U1", "U2", "U3", "U4", "U5", "U6", "U7"]:
+        data[uid] = {
+            "value": "resolved",
+            "source": "datasheet",
+            "confidence": "verified",
+            "affects_decisions": ["all"],
+            "evidence_date": "2026-10-25",
+        }
+    data["esp32_header_footprint"] = {
+        "value": "Connector_PinHeader_2.54mm:PinHeader_1x15_P2.54mm_Vertical",
+        "source": "datasheet",
+        "confidence": "verified",
+        "affects_decisions": ["footprint_placement"],
+        "evidence_date": "2026-10-25",
+    }
+    return data
+
+
+class TestGenerationBlockedByElectricalGate(unittest.TestCase):
+    """Generation must not proceed when electrical assumptions are unresolved."""
+
+    @patch.object(ai_pipeline, "run_environment_check", return_value=True)
+    @patch.object(ai_pipeline.sys, "argv", ["ai_pipeline.py", "test prompt"])
+    @patch.object(ai_pipeline.sys, "exit", side_effect=SystemExit(1))
+    @patch.object(ai_pipeline, "KiCadLLMInterface")
+    def test_no_profile_blocks_before_generation(
+        self, mock_llm, mock_exit, mock_env_check,
+    ):
+        """No hardware profile file -> all assumptions unresolved -> gate blocks."""
+        self.assertFalse(ai_pipeline.HARDWARE_PROFILE_PATH.is_file())
+
+        with self.assertRaises(SystemExit) as ctx:
+            ai_pipeline.main()
+
+        self.assertEqual(ctx.exception.code, 1)
+        mock_exit.assert_called_with(1)
+        # Generator must NOT be called
+        mock_llm.assert_not_called()
+
+    @patch.object(ai_pipeline, "run_environment_check", return_value=True)
+    @patch.object(ai_pipeline.sys, "argv", ["ai_pipeline.py", "test prompt"])
+    @patch.object(ai_pipeline.sys, "exit", side_effect=SystemExit(1))
+    @patch.object(ai_pipeline, "KiCadLLMInterface")
+    def test_unverified_profile_blocks_before_generation(
+        self, mock_llm, mock_exit, mock_env_check,
+    ):
+        """Profile with unresolved assumptions -> gate blocks before generation."""
+        with patch.object(
+            ai_pipeline, "HARDWARE_PROFILE_PATH",
+            Path(tempfile.mkdtemp()) / "nonexistent_profile.json",
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                ai_pipeline.main()
+
+            self.assertEqual(ctx.exception.code, 1)
+            mock_llm.assert_not_called()
+
+
+class TestGenerationAllowedWithVerifiedProfile(unittest.TestCase):
+    """Generation may proceed when all assumptions are verified."""
+
+    @patch.object(ai_pipeline, "run_environment_check", return_value=True)
+    @patch.object(ai_pipeline.sys, "argv", ["ai_pipeline.py", "test prompt"])
+    @patch.object(ai_pipeline.sys, "exit", side_effect=SystemExit(0))
+    @patch.object(ai_pipeline, "KiCadLLMInterface")
+    @patch.object(ai_pipeline, "write_staging_files")
+    @patch.object(ai_pipeline, "run_validation")
+    @patch.object(ai_pipeline, "input", return_value="no")
+    def test_verified_profile_allows_generation(
+        self, mock_input, mock_run_validation, mock_write_staging,
+        mock_llm, mock_exit, mock_env_check,
+    ):
+        """All assumptions verified -> gate passes -> generation proceeds."""
+        mock_llm_instance = MagicMock()
+        mock_llm_instance.generate_from_prompt.return_value = {
+            "schematic": "(kicad_sch (version 20260306))",
+            "pcb": "(kicad_pcb (version 20260206))",
+            "spec": MagicMock(),
+            "run_id": "20261025_120000",
+        }
+        mock_llm.return_value = mock_llm_instance
+
+        # Write staging files to real temp files so run_validation can copy them
+        tmpdir = tempfile.mkdtemp()
+        sch_path = Path(tmpdir) / "ESP32_BME280.kicad_sch"
+        pcb_path = Path(tmpdir) / "ESP32_BME280.kicad_pcb"
+        sch_path.write_text("(kicad_sch)", encoding="utf-8")
+        pcb_path.write_text("(kicad_pcb)", encoding="utf-8")
+        mock_write_staging.return_value = {
+            "staging_dir": Path(tmpdir),
+            "sch_path": sch_path,
+            "pcb_path": pcb_path,
+        }
+
+        mock_run_validation.return_value = {
+            "stdout": "", "stderr": "", "returncode": 0,
+            "erc": {"parseable": True, "errors": 0, "warnings": 0},
+            "drc": {"parseable": True, "violations": 0, "unconnected": 0,
+                    "footprint_errors": 0, "records": [], "unparsed_blocks": []},
+            "erc_report": "", "drc_report": "", "clean": True,
+        }
+
+        with tempfile.TemporaryDirectory() as profile_dir:
+            profile_path = Path(profile_dir) / "verified_profile.json"
+            profile_path.write_text(json.dumps(make_verified_profile_dict()), encoding="utf-8")
+
+            with patch.object(
+                ai_pipeline, "HARDWARE_PROFILE_PATH", profile_path,
+            ):
+                try:
+                    ai_pipeline.main()
+                except SystemExit:
+                    pass  # User said "no" at approval gate
+
+            # Generator WAS called
+            mock_llm.assert_called_once()
+            mock_llm_instance.generate_from_prompt.assert_called_once()
+
+
+class TestManufacturingBlockedByFabricationGate(unittest.TestCase):
+    """Manufacturing export must be blocked when fabrication assumptions unresolved."""
+
+    @patch.object(ai_pipeline, "run_environment_check", return_value=True)
+    @patch.object(ai_pipeline.sys, "argv", ["ai_pipeline.py", "test prompt"])
+    @patch.object(ai_pipeline.sys, "exit", side_effect=SystemExit(1))
+    @patch.object(ai_pipeline, "KiCadLLMInterface")
+    @patch.object(ai_pipeline, "write_staging_files")
+    @patch.object(ai_pipeline, "run_validation")
+    @patch.object(ai_pipeline, "input", return_value="yes")
+    @patch.object(ai_pipeline, "copy_staging_to_active", return_value=True)
+    def test_unverified_profile_blocks_manufacturing_export(
+        self, mock_copy, mock_input, mock_run_validation, mock_write_staging,
+        mock_llm, mock_exit, mock_env_check,
+    ):
+        """Unverified profile -> fabrication gate blocks before export."""
+        mock_llm_instance = MagicMock()
+        mock_llm_instance.generate_from_prompt.return_value = {
+            "schematic": "(kicad_sch)",
+            "pcb": "(kicad_pcb)",
+            "spec": MagicMock(),
+            "run_id": "20261025_120000",
+        }
+        mock_llm.return_value = mock_llm_instance
+
+        tmpdir = tempfile.mkdtemp()
+        sch_path = Path(tmpdir) / "ESP32_BME280.kicad_sch"
+        pcb_path = Path(tmpdir) / "ESP32_BME280.kicad_pcb"
+        sch_path.write_text("(kicad_sch)", encoding="utf-8")
+        pcb_path.write_text("(kicad_pcb)", encoding="utf-8")
+        mock_write_staging.return_value = {
+            "staging_dir": Path(tmpdir),
+            "sch_path": sch_path,
+            "pcb_path": pcb_path,
+        }
+
+        mock_run_validation.return_value = {
+            "stdout": "", "stderr": "", "returncode": 0,
+            "erc": {"parseable": True, "errors": 0, "warnings": 0},
+            "drc": {"parseable": True, "violations": 0, "unconnected": 0,
+                    "footprint_errors": 0, "records": [], "unparsed_blocks": []},
+            "erc_report": "", "drc_report": "", "clean": True,
+        }
+
+        # No verified profile -> fabrication gate blocks at G5
+        with patch.object(
+            ai_pipeline, "HARDWARE_PROFILE_PATH",
+            Path(tempfile.mkdtemp()) / "nonexistent.json",
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                ai_pipeline.main()
+
+            self.assertEqual(ctx.exception.code, 1)
+
+
+class TestConflictingEvidenceBlocks(unittest.TestCase):
+    """Conflicting evidence must block the relevant gate."""
+
+    @patch.object(ai_pipeline, "run_environment_check", return_value=True)
+    @patch.object(ai_pipeline.sys, "argv", ["ai_pipeline.py", "test prompt"])
+    @patch.object(ai_pipeline.sys, "exit", side_effect=SystemExit(1))
+    @patch.object(ai_pipeline, "KiCadLLMInterface")
+    def test_conflicting_u1_blocks_electrical(
+        self, mock_llm, mock_exit, mock_env_check,
+    ):
+        """Conflicting supply voltage -> electrical gate blocks."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            profile_path = Path(tmpdir) / "conflicting.json"
+            data = {
+                "U1": {
+                    "value": "3.3V",
+                    "source": "prompt_extract",
+                    "confidence": "conflicting",
+                    "affects_decisions": ["supply_net_selection"],
+                },
+                "U2": {
+                    "value": "GPIO21",
+                    "source": "datasheet",
+                    "confidence": "verified",
+                    "affects_decisions": ["schematic_wiring"],
+                },
+                "U3": {
+                    "value": True,
+                    "source": "datasheet",
+                    "confidence": "verified",
+                    "affects_decisions": ["schematic_resistors"],
+                },
+                "U7": {
+                    "value": "0x76",
+                    "source": "datasheet",
+                    "confidence": "verified",
+                    "affects_decisions": ["schematic_nets"],
+                },
+            }
+            profile_path.write_text(json.dumps(data), encoding="utf-8")
+
+            with patch.object(
+                ai_pipeline, "HARDWARE_PROFILE_PATH", profile_path,
+            ):
+                with self.assertRaises(SystemExit) as ctx:
+                    ai_pipeline.main()
+
+                self.assertEqual(ctx.exception.code, 1)
+                mock_llm.assert_not_called()
+
+
+class TestProfilePathProjectRelative(unittest.TestCase):
+    """Profile path must be resolved from project root, not CWD."""
+
+    @patch.object(ai_pipeline, "run_environment_check", return_value=True)
+    @patch.object(ai_pipeline.sys, "argv", ["ai_pipeline.py", "test prompt"])
+    @patch.object(ai_pipeline.sys, "exit", side_effect=SystemExit(1))
+    @patch.object(ai_pipeline, "KiCadLLMInterface")
+    def test_cannot_bypass_by_changing_cwd(
+        self, mock_llm, mock_exit, mock_env_check,
+    ):
+        """Changing CWD does not bypass the hardware gate."""
+        original_cwd = os.getcwd()
+        try:
+            os.chdir(tempfile.mkdtemp())
+            with self.assertRaises(SystemExit) as ctx:
+                ai_pipeline.main()
+            self.assertEqual(ctx.exception.code, 1)
+            mock_llm.assert_not_called()
+        finally:
+            os.chdir(original_cwd)
+
+
+class TestBlockedOperationNoSideEffects(unittest.TestCase):
+    """A blocked gate must not generate files, copy to active, or export."""
+
+    @patch.object(ai_pipeline, "run_environment_check", return_value=True)
+    @patch.object(ai_pipeline.sys, "argv", ["ai_pipeline.py", "test prompt"])
+    @patch.object(ai_pipeline.sys, "exit", side_effect=SystemExit(1))
+    @patch.object(ai_pipeline, "KiCadLLMInterface")
+    @patch.object(ai_pipeline, "write_staging_files")
+    @patch.object(ai_pipeline, "copy_staging_to_active")
+    @patch.object(ai_pipeline, "run_manufacturing_export")
+    def test_no_generation_copy_or_export_when_blocked(
+        self, mock_export, mock_copy, mock_write_staging,
+        mock_llm, mock_exit, mock_env_check,
+    ):
+        """Blocked gate -> no generation, no copy, no export."""
+        with self.assertRaises(SystemExit):
+            ai_pipeline.main()
+
+        mock_llm.assert_not_called()
+        mock_write_staging.assert_not_called()
+        mock_copy.assert_not_called()
+        mock_export.assert_not_called()
+
+
+class TestReturnContractPreserved(unittest.TestCase):
+    """run_validation() return contract must be unchanged."""
+
+    @patch.object(ai_pipeline, "run_powershell")
+    @patch.object(ai_pipeline.Path, "exists", return_value=True)
+    def test_validation_result_keys_unchanged(
+        self, mock_exists, mock_run_powershell,
+    ):
+        """run_validation() returns the same top-level keys as before."""
+        # Create real temp files for run_validation to copy
+        tmpdir = tempfile.mkdtemp()
+        sch_path = Path(tmpdir) / "ESP32_BME280.kicad_sch"
+        pcb_path = Path(tmpdir) / "ESP32_BME280.kicad_pcb"
+        sch_path.write_text("(kicad_sch)", encoding="utf-8")
+        pcb_path.write_text("(kicad_pcb)", encoding="utf-8")
+
+        mock_run_powershell.return_value = {
+            "stdout": "PASS", "stderr": "", "returncode": 0,
+        }
+        with patch.object(
+            ai_pipeline, "_parse_erc_report",
+            return_value={"parseable": True, "errors": 0, "warnings": 0},
+        ), patch.object(
+            ai_pipeline, "_parse_drc_report",
+            return_value={"parseable": True, "violations": 0, "unconnected": 0,
+                          "footprint_errors": 0},
+        ):
+            result = ai_pipeline.run_validation(sch_path, pcb_path)
+
+        expected_keys = {
+            "stdout", "stderr", "returncode",
+            "erc", "drc",
+            "erc_report", "drc_report", "clean",
+        }
+        self.assertEqual(set(result.keys()), expected_keys)
+
+
+# ---------------------------------------------------------------------------
+# Phase D4 regression tests: direct-call bypass prevention
+# ---------------------------------------------------------------------------
+
+
+class TestCopyStagingGateHardening(unittest.TestCase):
+    """Directly calling copy_staging_to_active() must be gated."""
+
+    def setUp(self):
+        self.sch_hash_before = hash_file(ai_pipeline.SCH_FILE)
+        self.pcb_hash_before = hash_file(ai_pipeline.PCB_FILE)
+
+    def tearDown(self):
+        self.assertEqual(
+            self.sch_hash_before, hash_file(ai_pipeline.SCH_FILE),
+            "Active schematic hash changed during test",
+        )
+        self.assertEqual(
+            self.pcb_hash_before, hash_file(ai_pipeline.PCB_FILE),
+            "Active PCB hash changed during test",
+        )
+
+    @patch.object(ai_pipeline, "shutil")
+    def test_copy_blocked_when_profile_missing(self, mock_shutil):
+        """Direct call with missing profile returns False, no shutil calls."""
+        result = ai_pipeline.copy_staging_to_active(
+            staging_dir=Path(tempfile.mkdtemp()),
+        )
+        self.assertFalse(result)
+        mock_shutil.copy2.assert_not_called()
+
+    @patch.object(ai_pipeline, "shutil")
+    def test_copy_blocked_when_profile_invalid_json(self, mock_shutil):
+        """Malformed JSON profile blocks copy before any file operation."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bad_profile = Path(tmpdir) / "hardware_profile.json"
+            bad_profile.write_text("{not valid json", encoding="utf-8")
+            with patch.object(
+                ai_pipeline, "HARDWARE_PROFILE_PATH", bad_profile,
+            ):
+                result = ai_pipeline.copy_staging_to_active(
+                    staging_dir=Path(tempfile.mkdtemp()),
+                )
+        self.assertFalse(result)
+        mock_shutil.copy2.assert_not_called()
+
+    @patch.object(ai_pipeline, "shutil")
+    def test_copy_blocked_when_electrical_assumption_missing(self, mock_shutil):
+        """Electrical assumption missing blocks both files."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            profile = Path(tmpdir) / "hardware_profile.json"
+            data = {"U4": {"confidence": "verified"}}  # only mechanical
+            profile.write_text(json.dumps(data), encoding="utf-8")
+            with patch.object(
+                ai_pipeline, "HARDWARE_PROFILE_PATH", profile,
+            ):
+                result = ai_pipeline.copy_staging_to_active(
+                    staging_dir=Path(tempfile.mkdtemp()),
+                )
+        self.assertFalse(result)
+        mock_shutil.copy2.assert_not_called()
+
+    @patch.object(ai_pipeline, "shutil")
+    def test_copy_blocked_when_mechanical_assumption_missing(self, mock_shutil):
+        """Mechanical assumption missing blocks both files."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            profile = Path(tmpdir) / "hardware_profile.json"
+            data = {
+                "U1": {"confidence": "verified"},
+                "U2": {"confidence": "verified"},
+                "U3": {"confidence": "verified"},
+                "U7": {"confidence": "verified"},
+            }
+            profile.write_text(json.dumps(data), encoding="utf-8")
+            with patch.object(
+                ai_pipeline, "HARDWARE_PROFILE_PATH", profile,
+            ):
+                result = ai_pipeline.copy_staging_to_active(
+                    staging_dir=Path(tempfile.mkdtemp()),
+                )
+        self.assertFalse(result)
+        mock_shutil.copy2.assert_not_called()
+
+    @patch.object(ai_pipeline, "shutil")
+    def test_copy_blocked_when_assumption_assumed(self, mock_shutil):
+        """Assumed (not verified) facts block copy."""
+        data = {uid: {"confidence": "assumed"} for uid in ["U1","U2","U3","U4","U5","U6","U7"]}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            profile = Path(tmpdir) / "hardware_profile.json"
+            profile.write_text(json.dumps(data), encoding="utf-8")
+            with patch.object(
+                ai_pipeline, "HARDWARE_PROFILE_PATH", profile,
+            ):
+                result = ai_pipeline.copy_staging_to_active(
+                    staging_dir=Path(tempfile.mkdtemp()),
+                )
+        self.assertFalse(result)
+        mock_shutil.copy2.assert_not_called()
+
+    @patch.object(ai_pipeline.os, "replace")
+    def test_copy_allows_with_verified_profile(self, mock_replace):
+        """Verified profile → both gates pass → os.replace called for both files."""
+        tmpdir = Path(tempfile.mkdtemp())
+        src_sch = tmpdir / "ESP32_BME280.kicad_sch"
+        src_pcb = tmpdir / "ESP32_BME280.kicad_pcb"
+        src_sch.write_text("(kicad_sch)", encoding="utf-8")
+        src_pcb.write_text("(kicad_pcb)", encoding="utf-8")
+
+        profile_data = make_verified_profile_dict()
+        with tempfile.TemporaryDirectory() as profile_dir:
+            profile_path = Path(profile_dir) / "hardware_profile.json"
+            profile_path.write_text(
+                json.dumps(profile_data), encoding="utf-8",
+            )
+            with patch.object(
+                ai_pipeline, "HARDWARE_PROFILE_PATH", profile_path,
+            ):
+                result = ai_pipeline.copy_staging_to_active(
+                    staging_dir=tmpdir,
+                )
+
+        self.assertTrue(result)
+        self.assertEqual(mock_replace.call_count, 2)
+
+
+class TestManufacturingExportGateHardening(unittest.TestCase):
+    """Directly calling run_manufacturing_export() must be gated."""
+
+    @patch.object(ai_pipeline, "run_powershell")
+    def test_export_blocked_when_profile_missing(self, mock_ps):
+        """Missing profile blocks export before any subprocess invocation."""
+        result = ai_pipeline.run_manufacturing_export(
+            confirm_yes=True, force=True,
+        )
+        self.assertFalse(result)
+        mock_ps.assert_not_called()
+
+    @patch.object(ai_pipeline, "run_powershell")
+    def test_export_blocked_when_profile_invalid_json(self, mock_ps):
+        """Malformed JSON profile blocks export."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bad_profile = Path(tmpdir) / "hardware_profile.json"
+            bad_profile.write_text("<<<not json>>>", encoding="utf-8")
+            with patch.object(
+                ai_pipeline, "HARDWARE_PROFILE_PATH", bad_profile,
+            ):
+                result = ai_pipeline.run_manufacturing_export(
+                    confirm_yes=True, force=True,
+                )
+        self.assertFalse(result)
+        mock_ps.assert_not_called()
+
+    @patch.object(ai_pipeline, "run_powershell")
+    def test_export_blocked_by_confirm_yes(self, mock_ps):
+        """confirm_yes=True cannot override a failed gate."""
+        result = ai_pipeline.run_manufacturing_export(confirm_yes=True)
+        self.assertFalse(result)
+        mock_ps.assert_not_called()
+
+    @patch.object(ai_pipeline, "run_powershell")
+    def test_export_blocked_by_force(self, mock_ps):
+        """force=True cannot override a failed gate."""
+        result = ai_pipeline.run_manufacturing_export(confirm_yes=True, force=True)
+        self.assertFalse(result)
+        mock_ps.assert_not_called()
+
+    def test_export_blocked_leaves_no_output_changes(self):
+        """Blocked export must not create or modify manufacturing outputs."""
+        mfg_dir = ai_pipeline.MANUFACTURING_DIR
+        gerber_dir = mfg_dir / "gerbers"
+        drill_dir = mfg_dir / "drill"
+
+        gerber_mtime_before = gerber_dir.stat().st_mtime_ns if gerber_dir.exists() else None
+        drill_mtime_before = drill_dir.stat().st_mtime_ns if drill_dir.exists() else None
+
+        result = ai_pipeline.run_manufacturing_export(confirm_yes=True, force=True)
+        self.assertFalse(result)
+
+        if gerber_dir.exists():
+            self.assertEqual(
+                gerber_mtime_before, gerber_dir.stat().st_mtime_ns,
+                "Gerber directory modified during blocked export",
+            )
+        if drill_dir.exists():
+            self.assertEqual(
+                drill_mtime_before, drill_dir.stat().st_mtime_ns,
+                "Drill directory modified during blocked export",
+            )
+
+    @patch.object(ai_pipeline, "run_powershell")
+    def test_export_allows_with_verified_profile(self, mock_ps):
+        """Verified profile permits the fabrication gate path."""
+        mock_ps.return_value = {"stdout": "OK", "stderr": "", "returncode": 0}
+        with tempfile.TemporaryDirectory() as profile_dir:
+            profile_path = Path(profile_dir) / "hardware_profile.json"
+            profile_path.write_text(
+                json.dumps(make_verified_profile_dict()), encoding="utf-8",
+            )
+            with patch.object(
+                ai_pipeline, "HARDWARE_PROFILE_PATH", profile_path,
+            ):
+                result = ai_pipeline.run_manufacturing_export(
+                    confirm_yes=True, force=True,
+                )
+        self.assertTrue(result)
+        mock_ps.assert_called_once()
+
+
+class TestGateReturnContract(unittest.TestCase):
+    """Verify return contracts of hardened functions."""
+
+    @patch.object(ai_pipeline, "shutil")
+    def test_copy_returns_bool(self, mock_shutil):
+        """copy_staging_to_active returns bool in all cases."""
+        result = ai_pipeline.copy_staging_to_active(
+            staging_dir=Path(tempfile.mkdtemp()),
+        )
+        self.assertIsInstance(result, bool)
+
+    @patch.object(ai_pipeline, "run_powershell")
+    def test_export_returns_bool(self, mock_ps):
+        """run_manufacturing_export returns bool in all cases."""
+        result = ai_pipeline.run_manufacturing_export(confirm_yes=True)
+        self.assertIsInstance(result, bool)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+
+def hash_file(path: Path) -> str:
+    """Return SHA-256 hex digest of a file, or empty string if missing."""
+    import hashlib
+    if not path.exists():
+        return ""
+    return hashlib.sha256(path.read_bytes()).hexdigest()

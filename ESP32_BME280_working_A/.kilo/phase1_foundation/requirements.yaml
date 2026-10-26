@@ -1,0 +1,69 @@
+schema_version: "1.0"
+project:
+  name: ESP32_BME280
+  root: 'C:/Users/Anirudh/OneDrive/Documents/kicad ai/ESP32_BME280'
+  kicad_version:
+    value: "10.0.7"
+    status: cli_verified
+  kicad_cli:
+    value: 'C:/Users/Anirudh/AppData/Local/Programs/KiCad/10.0/bin/kicad-cli.exe'
+    status: cli_verified
+hardware_target:
+  esp32_board: "ESP32 DevKit V1 30-pin"
+  esp32_variant: unverified
+  bme280_breakout: unverified
+  interface: I2C
+  board_type: beginner_friendly_carrier
+connections_provisional:
+  - esp32_pin: "3V3"
+    breakout_pin: "VCC/3.3V"
+    net: "3V3"
+    status: provisional_verify_supply_requirements
+  - esp32_pin: "GND"
+    breakout_pin: "GND"
+    net: "GND"
+    status: provisional
+  - esp32_pin: "GPIO21"
+    breakout_pin: "SDA"
+    net: "I2C_SDA"
+    status: provisional_verify_exact_board_pinout
+  - esp32_pin: "GPIO22"
+    breakout_pin: "SCL"
+    net: "I2C_SCL"
+    status: provisional_verify_exact_board_pinout
+unresolved_assumptions:
+  U1: "Verify BME280 breakout supply input range and onboard regulator."
+  U2: "Verify GPIO21/GPIO22 mapping against the exact ESP32 board."
+  U3: "Verify onboard I2C pull-ups, values, and configurability."
+  U4: "Verify breakout connector type and pitch."
+  U5: "Verify ESP32 board dimensions and mounting holes."
+  U6: "Verify breakout dimensions, pads, and mounting holes."
+  U7: "Verify I2C address 0x76/0x77 and SDO availability."
+footprints:
+  esp32_headers:
+    count: 2
+    pins_per_side: 15
+    pitch_mm: 2.54
+    status: proposed_unverified
+  bme280_connector:
+    count: 1
+    pins: 6
+    pitch: unverified
+    status: unassigned
+  pullup_resistors:
+    count: 2
+    value: "4.7k"
+    package: "0805"
+    status: proposed_not_approved
+workflow:
+  current_phase: phase1
+  current_stage: foundation_install_and_verify
+  status: VERIFIED_PENDING_U1_U7
+  next_action: "Resolve hardware assumptions U1-U7 (verify exact ESP32 DevKit V1 30-pin pinout and BME280 breakout specs) before any schematic recovery or PCB work. Do not start Phase 2."
+approval_gates:
+  G1: "Restore schematic backup to active project."
+  G2: "Create/modify PCB outline or active PCB."
+  G3: "Assign footprints to design symbols."
+  G4: "Route tracks or make consequential PCB edits."
+  G5: "Run manufacturing export."
+  G6: "Change global Kilo Code configuration or agent definitions."

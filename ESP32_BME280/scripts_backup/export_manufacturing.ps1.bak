@@ -1,0 +1,166 @@
+<#
+.SYNOPSIS
+    Export manufacturing files (Gerbers and drill files) from the PCB.
+
+.DESCRIPTION
+    Exports manufacturing outputs using the KiCad 10.0 CLI:
+
+      * Gerbers:  kicad-cli pcb export gerbers
+      * Drill:    kicad-cli pcb export drill
+
+    SAFETY REQUIREMENTS:
+      * An explicit -Confirm parameter is required before any export runs.
+      * Existing outputs are never overwritten unless -Force is also supplied.
+      * This script never modifies the schematic, PCB, or project settings.
+
+    These exports produce files for PCB fabrication. They are NOT hardware
+    testing and do NOT validate the design functionally.
+
+.PARAMETER ProjectDir
+    Absolute path to the ESP32_BME280 project directory.
+
+.PARAMETER KicadCli
+    Absolute path to the kicad-cli.exe executable.
+
+.PARAMETER OutputDir
+    Directory where manufacturing files will be written. Defaults to
+    <ProjectDir>\outputs\manufacturing.
+
+.PARAMETER Confirm
+    Required confirmation. Must be exactly "yes" to proceed. This prevents
+    accidental exports.
+
+.PARAMETER Force
+    Allow overwriting existing output files. Without this, the script aborts
+    if any target file already exists.
+
+.EXAMPLE
+    .\scripts\export_manufacturing.ps1 `
+        -ProjectDir "C:\Users\Anirudh\OneDrive\Documents\kicad ai\ESP32_BME280" `
+        -KicadCli "C:\Users\Anirudh\AppData\Local\Programs\KiCad\10.0\bin\kicad-cli.exe" `
+        -Confirm yes
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [string] $ProjectDir,
+
+    [Parameter(Mandatory = $true)]
+    [string] $KicadCli,
+
+    [string] $OutputDir = "",
+
+    [Parameter(Mandatory = $true)]
+    [ValidateSet("yes")]
+    [string] $Confirm,
+
+    [switch] $Force
+)
+
+$ErrorActionPreference = 'Stop'
+$scriptName = [System.IO.Path]::GetFileName($MyInvocation.MyCommand.Path)
+$failures = @()
+
+function Write-Status {
+    param([string] $Message, [string] $Level = "INFO")
+    $prefix = switch ($Level) {
+        "PASS" { "PASS" }
+        "FAIL" { "FAIL" }
+        "WARN" { "WARN" }
+        default { "INFO" }
+    }
+    Write-Host ("[{0}] {1}: {2}" -f $prefix, $scriptName, $Message)
+}
+
+# Resolve output directory
+if ([string]::IsNullOrWhiteSpace($OutputDir)) {
+    $OutputDir = Join-Path -Path $ProjectDir -ChildPath "outputs\manufacturing"
+}
+if (!(Test-Path -LiteralPath $OutputDir -PathType Container)) {
+    try {
+        New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+    } catch {
+        Write-Status "Failed to create output directory: $OutputDir" "FAIL"
+        exit 1
+    }
+}
+
+$pcbFile = Join-Path -Path $ProjectDir -ChildPath "ESP32_BME280.kicad_pcb"
+
+if (!(Test-Path -LiteralPath $pcbFile -PathType Leaf)) {
+    Write-Status "PCB file not found: $pcbFile" "FAIL"
+    exit 1
+}
+
+# Gerber output: KiCad `gerbers` writes into a folder; we target a folder.
+$gerberDir = Join-Path -Path $OutputDir -ChildPath "gerbers"
+$drillDir  = Join-Path -Path $OutputDir -ChildPath "drill"
+
+# Check for existing outputs (do not overwrite without -Force)
+$existingTargets = @()
+if (Test-Path -LiteralPath $gerberDir -PathType Container) {
+    $existingTargets += $gerberDir
+}
+if (Test-Path -LiteralPath $drillDir -PathType Container) {
+    $existingTargets += $drillDir
+}
+
+if ($existingTargets.Count -gt 0 -and !$Force) {
+    Write-Status "Output directories already exist. Use -Force to overwrite." "FAIL"
+    foreach ($t in $existingTargets) {
+        Write-Host ("  Existing: {0}" -f $t)
+    }
+    exit 1
+}
+
+Write-Status "Preparing to export manufacturing files from: $pcbFile"
+Write-Host ("  Gerbers -> {0}" -f $gerberDir)
+Write-Host ("  Drill   -> {0}" -f $drillDir)
+
+# ---- Export Gerbers ----
+Write-Status "Exporting Gerbers..."
+try {
+    & $KicadCli pcb export gerbers $pcbFile -o $gerberDir 2>&1 | Out-String
+    $gerberExitCode = $LASTEXITCODE
+    if ($gerberExitCode -eq 0) {
+        Write-Status "Gerber export completed (exit 0)" "PASS"
+    } else {
+        $failures += "Gerber export exited with code $gerberExitCode"
+        Write-Status "Gerber export failed (exit $gerberExitCode)" "FAIL"
+    }
+} catch {
+    $failures += "Gerber export did not run: $($_.Exception.Message)"
+    Write-Status "Gerber export did not run successfully" "FAIL"
+}
+
+# ---- Export Drill files ----
+Write-Status "Exporting drill files..."
+try {
+    & $KicadCli pcb export drill $pcbFile -o $drillDir 2>&1 | Out-String
+    $drillExitCode = $LASTEXITCODE
+    if ($drillExitCode -eq 0) {
+        Write-Status "Drill export completed (exit 0)" "PASS"
+    } else {
+        $failures += "Drill export exited with code $drillExitCode"
+        Write-Status "Drill export failed (exit $drillExitCode)" "FAIL"
+    }
+} catch {
+    $failures += "Drill export did not run: $($_.Exception.Message)"
+    Write-Status "Drill export did not run successfully" "FAIL"
+}
+
+Write-Host ""
+if ($failures.Count -gt 0) {
+    Write-Status "MANUFACTURING EXPORT FAILED" "FAIL"
+    foreach ($f in $failures) {
+        Write-Host ("  - {0}" -f $f)
+    }
+    exit 1
+}
+
+Write-Status "MANUFACTURING EXPORT COMPLETED" "PASS"
+Write-Host ""
+Write-Host "NOTE: Gerber and drill exports are fabrication outputs. They are NOT"
+Write-Host "design-rule checks and NOT hardware testing. Run validate_project.ps1"
+Write-Host "separately for ERC/DRC verification."
+exit 0

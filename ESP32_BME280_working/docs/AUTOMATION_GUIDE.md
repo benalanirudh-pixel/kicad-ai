@@ -1,0 +1,118 @@
+# ESP32_BME280 KiCad Automation Framework
+
+This directory contains a PowerShell-based automation framework for the
+ESP32_BME280 KiCad project. It wraps the KiCad 10.0 CLI (`kicad-cli.exe`) to
+run design-rule checks and export manufacturing files.
+
+## Verified toolchain
+
+- KiCad CLI: `C:\Users\Anirudh\AppData\Local\Programs\KiCad\10.0\bin\kicad-cli.exe`
+- KiCad version: 10.0.7
+- Project directory: `C:\Users\Anirudh\OneDrive\Documents\kicad ai\ESP32_BME280`
+
+## Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `scripts\check_environment.ps1` | Verify CLI, project files, and version before running anything. |
+| `scripts\validate_project.ps1` | Run schematic ERC and PCB DRC; save readable reports. Parses reports independently of CLI exit codes. Report format is KiCad "report" text only (no JSON). |
+| `scripts\export_manufacturing.ps1` | Export Gerbers and drill files (requires `-Confirm yes`; runs fresh ERC+DRC validation before every export; refused if validation fails or design incomplete). |
+| `scripts\check_outputs.ps1` | Verify generated files exist, are non-empty, zero-byte Gerbers rejected, header-only drill files rejected. |
+
+## Typical workflow
+
+Run from the project directory (`ESP32_BME280\`):
+
+```powershell
+# 1. Verify the environment
+.\scripts\check_environment.ps1 `
+    -ProjectDir "C:\Users\Anirudh\OneDrive\Documents\kicad ai\ESP32_BME280" `
+    -KicadCli "C:\Users\Anirudh\AppData\Local\Programs\KiCad\10.0\bin\kicad-cli.exe"
+
+# 2. Run design-rule checks (ERC + DRC)
+.\scripts\validate_project.ps1 `
+    -ProjectDir "C:\Users\Anirudh\OneDrive\Documents\kicad ai\ESP32_BME280" `
+    -KicadCli "C:\Users\Anirudh\AppData\Local\Programs\KiCad\10.0\bin\kicad-cli.exe"
+
+# 3. Check that reports were generated and parse cleanly
+.\scripts\check_outputs.ps1 `
+    -ProjectDir "C:\Users\Anirudh\OneDrive\Documents\kicad ai\ESP32_BME280" `
+    -CheckValidation
+
+# 4. Export manufacturing files (requires explicit confirmation; runs fresh validation first)
+.\scripts\export_manufacturing.ps1 `
+    -ProjectDir "C:\Users\Anirudh\OneDrive\Documents\kicad ai\ESP32_BME280" `
+    -KicadCli "C:\Users\Anirudh\AppData\Local\Programs\KiCad\10.0\bin\kicad-cli.exe" `
+    -Confirm yes
+
+# 5. Verify manufacturing outputs
+.\scripts\check_outputs.ps1 `
+    -ProjectDir "C:\Users\Anirudh\OneDrive\Documents\kicad ai\ESP32_BME280" `
+    -CheckManufacturing
+```
+
+## Important safety rules
+
+- **KiCad has the project open.** The lock file `~ESP32_BME280.kicad_pro.lck`
+  exists. Do not delete it and do not terminate KiCad.
+- These scripts never modify the schematic, PCB, or project settings.
+- Existing outputs are never overwritten unless `-Force` is supplied to
+  `export_manufacturing.ps1`.
+- All file paths are quoted to handle the space in `kicad ai`.
+- Manufacturing export is **refused by default** if:
+  - Fresh pre-export ERC/DRC validation finds violations,
+  - The schematic is empty,
+  - The PCB has no valid Edge.Cuts outline.
+  There is no override flag to silently bypass these checks.
+- `export_manufacturing.ps1` runs fresh ERC and DRC validation against the
+  current source files immediately before every export. Pre-existing reports
+  are never trusted.
+
+## Report format
+
+ERC and DRC reports are written in KiCad's native "report" text format only
+(`ESP32_BME280_erc_report.txt`, `ESP32_BME280_drc_report.txt`). JSON report
+generation is not supported, to avoid format/extension mismatch.
+
+## Design-rule checks vs. hardware testing
+
+ERC (Electrical Rules Check) and DRC (Design Rules Check) are **design-rule
+checks only**. They verify the design against KiCad's electrical and physical
+rules. A passing result means no violations were reported; it does NOT mean:
+
+- the circuit is electrically correct,
+- the board is manufacturable, or
+- any hardware has been tested.
+
+These scripts never suppress violations and never claim a design is validated
+if a check did not run successfully. Hardware testing is a separate activity
+outside the scope of this framework.
+
+## Blank board handling
+
+A blank project (no components, no board outline) will FAIL validation:
+- Empty schematic → reported as INCOMPLETE
+- Missing Edge.Cuts outline → reported as INCOMPLETE
+- DRC violation (malformed outline) → reported as violation
+
+Test artifacts generated from a blank board are NOT manufacturing-ready.
+
+## Safe recovery procedure
+
+If a script fails:
+
+1. Read the error message and the generated report files under
+   `outputs\validation\` or `outputs\manufacturing\`.
+2. For ERC/DRC failures, open the corresponding report and review each
+   violation. Do not suppress or ignore violations without engineering review.
+3. Re-run `check_environment.ps1` to confirm the CLI and project files are
+   still accessible.
+4. Fix the design in KiCad (while KiCad is open), then re-run validation.
+5. If a lock file prevents access, close KiCad cleanly first — never delete
+   the lock file manually.
+
+## Outputs
+
+- `outputs\validation\` — ERC and DRC reports.
+- `outputs\manufacturing\gerbers\` — Gerber plot files.
+- `outputs\manufacturing\drill\` — Drill files.

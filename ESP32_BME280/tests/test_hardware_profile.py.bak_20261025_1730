@@ -1,0 +1,463 @@
+#!/usr/bin/env python3
+"""
+Tests for hardware_profile.py — hardware-profile model and gate functions.
+
+Uses temporary directories and fixtures. Does not modify active project files.
+"""
+
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+AI_DIR = r"C:\Users\Anirudh\OneDrive\Documents\kicad ai\ESP32_BME280\scripts\ai"
+if AI_DIR not in sys.path:
+    sys.path.insert(0, AI_DIR)
+
+import hardware_profile
+from hardware_profile import (
+    HardwareFact,
+    HardwareProfile,
+    GateResult,
+    gate_electrical_schematic,
+    gate_mechanical_footprint,
+    gate_fabrication_release,
+    gate_all,
+    CONFIDENCE_VERIFIED,
+    CONFIDENCE_ASSUMED,
+    CONFIDENCE_UNRESOLVED,
+    CONFIDENCE_CONFLICTING,
+)
+
+
+# --------------------------------------------------------------------------- helpers
+
+
+def write_profile(tmpdir: str, data: dict) -> Path:
+    """Write a profile JSON file to a temp directory and return its path."""
+    p = Path(tmpdir) / "hardware_profile.json"
+    p.write_text(json.dumps(data), encoding="utf-8")
+    return p
+
+
+def make_profile(facts: dict) -> HardwareProfile:
+    """Build a HardwareProfile from a dict of fact-name -> HardwareFact."""
+    return HardwareProfile(facts)
+
+
+# --------------------------------------------------------------------------- missing profile file
+
+
+class TestMissingProfile(unittest.TestCase):
+    """A missing profile file must default to fail-closed."""
+
+    def test_missing_profile_returns_empty(self):
+        profile = HardwareProfile.from_file(Path(tempfile.mkdtemp()) / "nonexistent.json")
+        self.assertEqual(len(profile.facts), 0)
+        # Every assumption must be blocked.
+        result = gate_electrical_schematic(profile)
+        self.assertFalse(result.allowed)
+        self.assertIn("U1", result.blocking_assumptions)
+        self.assertIn("U2", result.blocking_assumptions)
+        self.assertIn("U3", result.blocking_assumptions)
+        self.assertIn("U7", result.blocking_assumptions)
+
+    def test_missing_profile_blocks_mechanical(self):
+        profile = HardwareProfile.from_file(Path(tempfile.mkdtemp()) / "nonexistent.json")
+        result = gate_mechanical_footprint(profile)
+        self.assertFalse(result.allowed)
+        self.assertEqual(set(result.blocking_assumptions), {"U4", "U5", "U6"})
+
+    def test_missing_profile_blocks_fabrication(self):
+        profile = HardwareProfile.from_file(Path(tempfile.mkdtemp()) / "nonexistent.json")
+        result = gate_fabrication_release(profile)
+        self.assertFalse(result.allowed)
+        self.assertEqual(set(result.blocking_assumptions), {"U1", "U2", "U3", "U4", "U5", "U6", "U7"})
+
+
+# --------------------------------------------------------------------------- missing required fields
+
+
+class TestMissingFields(unittest.TestCase):
+    """Missing required fields must block their dependent gates."""
+
+    def test_missing_u1_blocks_electrical(self):
+        profile = make_profile({})
+        result = gate_electrical_schematic(profile)
+        self.assertFalse(result.allowed)
+        self.assertIn("U1", result.blocking_assumptions)
+
+    def test_missing_u2_blocks_electrical(self):
+        profile = make_profile({"U2": HardwareFact(confidence=CONFIDENCE_UNRESOLVED)})
+        result = gate_electrical_schematic(profile)
+        self.assertFalse(result.allowed)
+        self.assertIn("U2", result.blocking_assumptions)
+
+    def test_missing_u3_blocks_electrical(self):
+        profile = make_profile({"U3": HardwareFact(confidence=CONFIDENCE_UNRESOLVED)})
+        result = gate_electrical_schematic(profile)
+        self.assertFalse(result.allowed)
+        self.assertIn("U3", result.blocking_assumptions)
+
+    def test_missing_u7_blocks_electrical(self):
+        profile = make_profile({"U7": HardwareFact(confidence=CONFIDENCE_UNRESOLVED)})
+        result = gate_electrical_schematic(profile)
+        self.assertFalse(result.allowed)
+        self.assertIn("U7", result.blocking_assumptions)
+
+    def test_missing_u4_blocks_mechanical(self):
+        profile = make_profile({})
+        result = gate_mechanical_footprint(profile)
+        self.assertFalse(result.allowed)
+        self.assertIn("U4", result.blocking_assumptions)
+
+    def test_missing_u5_blocks_mechanical(self):
+        profile = make_profile({"U5": HardwareFact(confidence=CONFIDENCE_UNRESOLVED)})
+        result = gate_mechanical_footprint(profile)
+        self.assertFalse(result.allowed)
+        self.assertIn("U5", result.blocking_assumptions)
+
+    def test_missing_u6_blocks_mechanical(self):
+        profile = make_profile({"U6": HardwareFact(confidence=CONFIDENCE_UNRESOLVED)})
+        result = gate_mechanical_footprint(profile)
+        self.assertFalse(result.allowed)
+        self.assertIn("U6", result.blocking_assumptions)
+
+
+# --------------------------------------------------------------------------- unresolved vs conflicting
+
+
+class TestUnresolvedAndConflicting(unittest.TestCase):
+    """Unresolved and conflicting facts must block gates."""
+
+    def test_unresolved_u1_blocks_electrical(self):
+        profile = make_profile({"U1": HardwareFact(confidence=CONFIDENCE_UNRESOLVED)})
+        result = gate_electrical_schematic(profile)
+        self.assertFalse(result.allowed)
+        self.assertIn("U1", result.blocking_assumptions)
+        self.assertIn("unresolved", result.reason.lower())
+
+    def test_conflicting_u2_blocks_electrical(self):
+        profile = make_profile({
+            "U2": HardwareFact(
+                confidence=CONFIDENCE_CONFLICTING,
+                value="GPIO21",
+                source="prompt_extract",
+            ),
+        })
+        result = gate_electrical_schematic(profile)
+        self.assertFalse(result.allowed)
+        self.assertIn("U2", result.blocking_assumptions)
+        self.assertGreaterEqual(len(result.conflicts), 1)
+
+    def test_conflicting_u4_blocks_mechanical(self):
+        profile = make_profile({
+            "U4": HardwareFact(
+                confidence=CONFIDENCE_CONFLICTING,
+                value="2.54mm",
+                source="datasheet",
+            ),
+        })
+        result = gate_mechanical_footprint(profile)
+        self.assertFalse(result.allowed)
+        self.assertIn("U4", result.blocking_assumptions)
+
+    def test_all_unresolved_blocks_fabrication(self):
+        profile = make_profile({})
+        result = gate_fabrication_release(profile)
+        self.assertFalse(result.allowed)
+        self.assertEqual(
+            set(result.blocking_assumptions), {"U1", "U2", "U3", "U4", "U5", "U6", "U7"}
+        )
+
+
+# --------------------------------------------------------------------------- assumed vs verified
+
+
+class TestAssumedVsVerified(unittest.TestCase):
+    """Explicitly assumed facts may pass gates; verified facts always pass."""
+
+    def test_assumed_u1_passes_electrical(self):
+        # U1 assumed by user — allowed to proceed with user sign-off recorded.
+        profile = make_profile({
+            "U1": HardwareFact(
+                value="3.3V-5V",
+                source="user_selection",
+                confidence=CONFIDENCE_ASSUMED,
+                affects_decisions=["supply_net_selection"],
+            ),
+            "U2": HardwareFact(
+                value="GPIO21",
+                source="user_selection",
+                confidence=CONFIDENCE_ASSUMED,
+                affects_decisions=["schematic_wiring"],
+            ),
+            "U3": HardwareFact(
+                value=True,
+                source="user_selection",
+                confidence=CONFIDENCE_ASSUMED,
+                affects_decisions=["schematic_resistors"],
+            ),
+            "U7": HardwareFact(
+                value="0x76",
+                source="user_selection",
+                confidence=CONFIDENCE_ASSUMED,
+                affects_decisions=["schematic_nets"],
+            ),
+        })
+        result = gate_electrical_schematic(profile)
+        self.assertTrue(result.allowed)
+        self.assertEqual(result.blocking_assumptions, [])
+        self.assertIn("resolved", result.reason.lower())
+
+    def test_verified_u1_passes_electrical(self):
+        profile = make_profile({
+            "U1": HardwareFact(
+                value="3.3V-5V",
+                source="datasheet",
+                confidence=CONFIDENCE_VERIFIED,
+                affects_decisions=["supply_net_selection"],
+                evidence_date="2026-10-25",
+            ),
+            "U2": HardwareFact(
+                value="GPIO21",
+                source="datasheet",
+                confidence=CONFIDENCE_VERIFIED,
+                affects_decisions=["schematic_wiring"],
+                evidence_date="2026-10-25",
+            ),
+            "U3": HardwareFact(
+                value=True,
+                source="datasheet",
+                confidence=CONFIDENCE_VERIFIED,
+                affects_decisions=["schematic_resistors"],
+                evidence_date="2026-10-25",
+            ),
+            "U7": HardwareFact(
+                value="0x76",
+                source="datasheet",
+                confidence=CONFIDENCE_VERIFIED,
+                affects_decisions=["schematic_nets"],
+                evidence_date="2026-10-25",
+            ),
+        })
+        result = gate_electrical_schematic(profile)
+        self.assertTrue(result.allowed)
+
+    def test_mix_assumed_and_unresolved_blocks(self):
+        profile = make_profile({
+            "U1": HardwareFact(confidence=CONFIDENCE_ASSUMED),
+            "U2": HardwareFact(confidence=CONFIDENCE_UNRESOLVED),
+            "U3": HardwareFact(confidence=CONFIDENCE_ASSUMED),
+            "U7": HardwareFact(confidence=CONFIDENCE_ASSUMED),
+        })
+        result = gate_electrical_schematic(profile)
+        self.assertFalse(result.allowed)
+        self.assertIn("U2", result.blocking_assumptions)
+
+
+# --------------------------------------------------------------------------- footprints
+
+
+class TestFootprints(unittest.TestCase):
+    """Footprint facts must be verified for fabrication release."""
+
+    def test_no_verified_footprint_blocks_fabrication(self):
+        profile = make_profile({
+            # All assumptions verified
+            "U1": HardwareFact(confidence=CONFIDENCE_VERIFIED),
+            "U2": HardwareFact(confidence=CONFIDENCE_VERIFIED),
+            "U3": HardwareFact(confidence=CONFIDENCE_VERIFIED),
+            "U7": HardwareFact(confidence=CONFIDENCE_VERIFIED),
+            "U4": HardwareFact(confidence=CONFIDENCE_VERIFIED),
+            "U5": HardwareFact(confidence=CONFIDENCE_VERIFIED),
+            "U6": HardwareFact(confidence=CONFIDENCE_VERIFIED),
+            # Footprint only assumed, not verified
+            "esp32_header_footprint": HardwareFact(
+                value="Connector_PinHeader_2.54mm:PinHeader_1x15_P2.54mm_Vertical",
+                confidence=CONFIDENCE_ASSUMED,
+            ),
+        })
+        result = gate_fabrication_release(profile)
+        self.assertFalse(result.allowed)
+        self.assertIn("footprint", result.reason.lower())
+
+    def test_verified_footprint_allows_fabrication(self):
+        profile = make_profile({
+            "U1": HardwareFact(confidence=CONFIDENCE_VERIFIED),
+            "U2": HardwareFact(confidence=CONFIDENCE_VERIFIED),
+            "U3": HardwareFact(confidence=CONFIDENCE_VERIFIED),
+            "U7": HardwareFact(confidence=CONFIDENCE_VERIFIED),
+            "U4": HardwareFact(confidence=CONFIDENCE_VERIFIED),
+            "U5": HardwareFact(confidence=CONFIDENCE_VERIFIED),
+            "U6": HardwareFact(confidence=CONFIDENCE_VERIFIED),
+            "esp32_header_footprint": HardwareFact(
+                value="Connector_PinHeader_2.54mm:PinHeader_1x15_P2.54mm_Vertical",
+                confidence=CONFIDENCE_VERIFIED,
+            ),
+        })
+        result = gate_fabrication_release(profile)
+        self.assertTrue(result.allowed)
+
+
+# --------------------------------------------------------------------------- invalid schema
+
+
+class TestInvalidSchema(unittest.TestCase):
+    """Invalid profile schema must raise ValueError."""
+
+    def test_non_dict_root_raises(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "bad.json"
+            p.write_text('[1, 2, 3]', encoding="utf-8")
+            with self.assertRaises(ValueError):
+                HardwareProfile.from_file(p)
+
+    def test_invalid_json_raises(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "bad.json"
+            p.write_text("{not valid json", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                HardwareProfile.from_file(p)
+
+    def test_invalid_confidence_raises(self):
+        with self.assertRaises(ValueError):
+            HardwareFact(confidence="not_a_valid_confidence")
+
+    def test_non_dict_entry_raises(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "bad.json"
+            p.write_text(json.dumps({"U1": "just_a_string"}), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                HardwareProfile.from_file(p)
+
+
+# --------------------------------------------------------------------------- bypass attempts
+
+
+class TestBypassAttempts(unittest.TestCase):
+    """A skip_gates flag or arbitrary override must not bypass a blocked gate."""
+
+    def test_skip_gates_flag_ignored(self):
+        # Even if a caller passes skip_gates=True, the gate function itself
+        # does not accept or honor such a flag — it always checks facts.
+        profile = make_profile({"U1": HardwareFact(confidence=CONFIDENCE_UNRESOLVED)})
+        result = gate_electrical_schematic(profile)
+        self.assertFalse(result.allowed)
+        self.assertIn("U1", result.blocking_assumptions)
+
+    def test_user_confirmation_does_not_override_unverified(self):
+        # Gate functions have no user_confirmation parameter; facts determine
+        # the outcome. An unresolved fact blocks regardless of any external
+        # confirmation.
+        profile = make_profile({"U1": HardwareFact(confidence=CONFIDENCE_UNRESOLVED)})
+        result = gate_electrical_schematic(profile)
+        self.assertFalse(result.allowed)
+
+    def test_conflict_not_overridable(self):
+        profile = make_profile({
+            "U1": HardwareFact(
+                confidence=CONFIDENCE_CONFLICTING,
+                value="3.3V",
+                source="prompt_extract",
+            ),
+        })
+        result = gate_electrical_schematic(profile)
+        self.assertFalse(result.allowed)
+        self.assertGreaterEqual(len(result.conflicts), 1)
+
+
+# --------------------------------------------------------------------------- gate structure
+
+
+class TestGateStructure(unittest.TestCase):
+    """Gate results must have the required structure."""
+
+    def test_gate_result_fields(self):
+        profile = make_profile({})
+        result = gate_electrical_schematic(profile)
+        self.assertIsInstance(result, GateResult)
+        self.assertIsInstance(result.allowed, bool)
+        self.assertIsInstance(result.blocking_assumptions, list)
+        self.assertIsInstance(result.conflicts, list)
+        self.assertIsInstance(result.reason, str)
+
+    def test_gate_all_returns_all_three(self):
+        profile = make_profile({})
+        results = gate_all(profile)
+        self.assertIn("electrical_schematic", results)
+        self.assertIn("mechanical_footprint", results)
+        self.assertIn("fabrication_release", results)
+        self.assertIsInstance(results["electrical_schematic"], GateResult)
+        self.assertIsInstance(results["mechanical_footprint"], GateResult)
+        self.assertIsInstance(results["fabrication_release"], GateResult)
+
+
+# --------------------------------------------------------------------------- hardware fact validation
+
+
+class TestHardwareFact(unittest.TestCase):
+    """HardwareFact validation."""
+
+    def test_valid_confidences(self):
+        for conf in (CONFIDENCE_VERIFIED, CONFIDENCE_ASSUMED,
+                     CONFIDENCE_UNRESOLVED, CONFIDENCE_CONFLICTING):
+            fact = HardwareFact(confidence=conf)
+            self.assertEqual(fact.confidence, conf)
+
+    def test_invalid_confidence_raises(self):
+        with self.assertRaises(ValueError):
+            HardwareFact(confidence="invalid")
+
+    def test_default_confidence_is_unresolved(self):
+        fact = HardwareFact()
+        self.assertEqual(fact.confidence, CONFIDENCE_UNRESOLVED)
+
+    def test_affects_decisions_defaults_to_empty(self):
+        fact = HardwareFact()
+        self.assertEqual(fact.affects_decisions, [])
+
+
+# --------------------------------------------------------------------------- profile loading from file
+
+
+class TestProfileFileLoading(unittest.TestCase):
+    """Loading profiles from JSON files."""
+
+    def test_load_valid_profile(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = write_profile(tmpdir, {
+                "U1": {
+                    "value": "3.3V-5V",
+                    "source": "datasheet",
+                    "confidence": "verified",
+                    "affects_decisions": ["supply_net_selection"],
+                },
+            })
+            profile = HardwareProfile.from_file(p)
+            fact = profile.fact("U1")
+            self.assertIsNotNone(fact)
+            self.assertEqual(fact.value, "3.3V-5V")
+            self.assertEqual(fact.confidence, CONFIDENCE_VERIFIED)
+
+    def test_load_profile_with_all_assumptions(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = write_profile(tmpdir, {
+                "U1": {"confidence": "verified"},
+                "U2": {"confidence": "verified"},
+                "U3": {"confidence": "verified"},
+                "U7": {"confidence": "verified"},
+                "U4": {"confidence": "verified"},
+                "U5": {"confidence": "verified"},
+                "U6": {"confidence": "verified"},
+            })
+            profile = HardwareProfile.from_file(p)
+            result = gate_electrical_schematic(profile)
+            self.assertTrue(result.allowed)
+            result = gate_mechanical_footprint(profile)
+            self.assertTrue(result.allowed)
+
+
+if __name__ == "__main__":
+    unittest.main()

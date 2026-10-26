@@ -1,0 +1,25 @@
+# KiCad automation framework outputs and caches
+
+# Generated validation reports
+outputs/validation/
+
+# Generated manufacturing files
+outputs/manufacturing/
+
+# KiCad lock files (created by KiCad when a project is open)
+~*.kicad_pro.lck
+
+# KiCad auto-backup files
+*.kicad_sch.bak
+*.kicad_pcb.bak
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+Thumbs.db
+.DS_Store

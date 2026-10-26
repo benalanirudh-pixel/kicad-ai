@@ -1,0 +1,42 @@
+{
+  "projectIdentifier": "ESP32_BME280",
+  "projectRoot": "C:\\Users\\Anirudh\\OneDrive\\Documents\\kicad ai\\ESP32_BME280",
+  "currentPhase": "phase1",
+  "currentStage": "foundation_install_and_verify",
+  "status": "VERIFIED_PENDING_U1_U7",
+  "packageStatus": "installed_and_validated",
+  "lastVerifiedOperation": "Verified KiCad CLI 10.0.7, KiCad running (PID 20156), no lock file, computed source file hashes, validated JSON and YAML",
+  "pendingOperations": [
+    "Identify exact ESP32 DevKit and BME280 breakout hardware",
+    "Resolve U1-U7 before schematic recovery"
+  ],
+  "blockers": [
+    "Electrical and mechanical assumptions U1-U7 remain unverified"
+  ],
+  "approvalRequirements": {
+    "G1": "Restore schematic backup to active project",
+    "G2": "Create or modify active PCB outline",
+    "G3": "Assign footprints",
+    "G4": "Route tracks or make consequential PCB edits",
+    "G5": "Run manufacturing export",
+    "G6": "Change global Kilo Code configuration or agent definitions"
+  },
+  "unresolvedAssumptions": {
+    "U1": "BME280 breakout supply range/regulator",
+    "U2": "Exact ESP32 GPIO21/GPIO22 pin mapping",
+    "U3": "BME280 breakout I2C pull-ups",
+    "U4": "Breakout connector type and pitch",
+    "U5": "ESP32 board dimensions and mounting holes",
+    "U6": "BME280 breakout dimensions and mounting holes",
+    "U7": "BME280 I2C address and SDO availability"
+  },
+  "sourceFileHashes": {
+    "ESP32_BME280.kicad_pro": "2BAE4D471285E798C718647B27FB86FC9D7DCF4E1E0CDE1BE6FD0F8474C28757",
+    "ESP32_BME280.kicad_sch": "DF848D0A2CCC853330ACEA0B54B5F41C403409E8CE3FE70FD9127CF297DFC3FA",
+    "ESP32_BME280.kicad_pcb": "9732C37867CD081621490A6345DB7CAEB4599F087175AFCDD57D0DF064127DE4",
+    "ESP32_BME280.kicad_prl": "9B25098616E4CE142878C9F32443C1E632D5610785393A1BDCB185976833F8CE",
+    "ESP32_BME280.kicad_sch.before_en_dash_": "FB4B939FB3DCC3391750093785526FC2C0224C3DC82496F190DE1DFA9D4774E4",
+    "ESP32_BME280.kicad_sch.backup_20261020_125309": "FB4B939FB3DCC3391750093785526FC2C0224C3DC82496F190DE1DFA9D4774E4"
+  },
+  "exactNextAction": "Resolve hardware assumptions U1-U7 (verify exact ESP32 DevKit V1 30-pin pinout and BME280 breakout specs) before any schematic recovery or PCB work. Do not start Phase 2."
+}
